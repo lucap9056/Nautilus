@@ -30,7 +30,10 @@ git clone https://github.com/your-repo/nautrouds.git
 cd nautrouds
 
 # Build the core binary
-go build -o bin/nautrouds-core ./cmd/nautrouds-core
+go build -o bin/nautrouds-core ./cmd/core
+
+# Build the ntuc compiler
+go build -o bin/ntuc ./cmd/ntuc
 ```
 
 ### Usage
@@ -58,7 +61,7 @@ Use the `ntuc` tool to compile your `Ntufile` into a binary format readable by t
 
 ```text
 # Basic routing rules
-GET /api/v1/users $user-service
+GET /api/v1/users user-service
     $SetHeader(X-Source, Nautrouds)
     $BasicAuth(admin, secret)
 
@@ -140,18 +143,11 @@ Route and middleware directives can be templated from request data (`{header.X}`
 - **Risk**: a client can effectively choose which service or built-in runs if a directive name/target is templated from unvalidated request data.
 - **Guidance**: prefer interpolating only argument *values* (e.g. a comparison target), not directive names or service names, unless every value the tag can take has been validated.
 
-#### 5. `X-Forwarded-For`
-
-Backend requests are proxied with Go's `httputil.ReverseProxy`, which appends to (rather than replaces) any pre-existing `X-Forwarded-For` header.
-
-- **Risk**: a backend that trusts the header verbatim can be fed a spoofed origin IP by the client.
-- **Guidance**: backends should only trust the last hop's contribution (the one Nautrouds itself appended); prefer `RemoteAddr`-based `$IPAllow` at the edge for origin-IP enforcement.
-
-#### 6. `-token` is not an auth mechanism
+#### 5. `-token` is not an auth mechanism
 
 It only namespaces entrypoint socket filenames so multiple instances sharing an `EntrypointDir` don't collide. Access control for entrypoint sockets is entirely a function of filesystem permissions on `EntrypointDir`.
 
-#### 7. Privilege dropping (Docker)
+#### 6. Privilege dropping (Docker)
 
 The Nautrouds Docker image starts as `root` to initialize the environment and then immediately drops privileges to a non-root `nautrouds` user for execution.
 
