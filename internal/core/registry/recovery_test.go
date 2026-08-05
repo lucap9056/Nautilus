@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"nautrouds/internal/core/registry/forwarder"
+	"nautrouds/internal/core/registry/loadbalance"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,7 +17,14 @@ import (
 // probe failures never reach the registry's listenFailures goroutine.
 func makeForwarder(socketPath string) *forwarder.Forwarder {
 	failCh := make(chan forwarder.FailureForwarder, 1)
-	return forwarder.New("svc", socketPath, failCh)
+	weight, _ := loadbalance.ParseNodeWeight(socketPath)
+	return forwarder.New("svc", socketPath, weight, failCh)
+}
+
+func newTestServiceSet(nodes []string, strategy loadbalance.Strategy, nodeMap map[string]*nodeContext) *ServiceSet {
+	ss := newServiceSet(nodes, strategy)
+	rebuildLoadBalancer(ss, nodeMap)
+	return ss
 }
 
 // --- GetNodes ---
@@ -84,9 +92,9 @@ func TestGetState_EmptyWhenNoServices(t *testing.T) {
 	assert.Empty(t, reg.GetState())
 }
 
-// --- GetForwarder ---
+// --- GetForwarders ---
 
-func TestGetForwarder_ErrorOnMissingService(t *testing.T) {
+func TestGetForwarders_NilForMissingService(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "nautrouds-getfwd-miss-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -94,11 +102,10 @@ func TestGetForwarder_ErrorOnMissingService(t *testing.T) {
 	reg, err := NewRegistry()
 	require.NoError(t, err)
 
-	_, err = reg.GetForwarder("nonexistent")
-	assert.Error(t, err)
+	assert.Nil(t, reg.GetForwarders("nonexistent"))
 }
 
-func TestGetForwarder_RoundRobin(t *testing.T) {
+func TestGetForwarders_RoundRobin(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "nautrouds-getfwd-rr-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -115,20 +122,17 @@ func TestGetForwarder_RoundRobin(t *testing.T) {
 	reg.mu.Lock()
 	reg.nodeMap[s1] = &nodeContext{serviceName: "svc", forwarder: f1}
 	reg.nodeMap[s2] = &nodeContext{serviceName: "svc", forwarder: f2}
-	reg.services["svc"] = &ServiceSet{nodes: []string{s1, s2}}
+	reg.services["svc"] = newTestServiceSet([]string{s1, s2}, loadbalance.StrategyRoundRobin, reg.nodeMap)
 	reg.mu.Unlock()
 
-	got1, err := reg.GetForwarder("svc")
-	require.NoError(t, err)
-	got2, err := reg.GetForwarder("svc")
-	require.NoError(t, err)
+	got1 := reg.GetForwarders("svc")[0]
+	got2 := reg.GetForwarders("svc")[0]
 
 	// With 2 nodes, consecutive calls must return different forwarders.
 	assert.NotSame(t, got1, got2)
 
 	// Third call wraps back to the first forwarder.
-	got3, err := reg.GetForwarder("svc")
-	require.NoError(t, err)
+	got3 := reg.GetForwarders("svc")[0]
 	assert.Same(t, got1, got3)
 }
 

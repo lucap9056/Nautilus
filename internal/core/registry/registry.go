@@ -5,6 +5,7 @@ import (
 	"nautrouds/internal/core/logs"
 	"nautrouds/internal/core/metrics"
 	"nautrouds/internal/core/registry/forwarder"
+	"nautrouds/internal/core/registry/loadbalance"
 	"os"
 	"slices"
 	"sync"
@@ -17,63 +18,104 @@ import (
 type Registry struct {
 	mu sync.RWMutex
 
-	services  map[string]*ServiceSet // serviceName -> node list & load balanced index
+	services  map[string]*ServiceSet
 	unhealthy map[string]*ServiceSet
-	nodeMap   map[string]*nodeContext // nodePath -> forwarder & service name
+	nodeMap   map[string]*nodeContext
 
 	failureChan chan forwarder.FailureForwarder
 }
 
 type ServiceSet struct {
-	nodes     []string
-	nodeIndex map[string]int // node -> position in nodes; O(1) lookup & removal
-	index     atomic.Uint32
-	strategy  Strategy
+	nodes         []string
+	nodePositions map[string]int
+	roundRobin    atomic.Pointer[loadbalance.RoundRobin]
+	leastInFlight atomic.Pointer[loadbalance.LeastInFlight]
+	strategy      loadbalance.Strategy
 }
 
-func newServiceSet(nodes []string, strategy Strategy) *ServiceSet {
+func newServiceSet(nodes []string, strategy loadbalance.Strategy) *ServiceSet {
 	ss := &ServiceSet{strategy: strategy}
 	ss.replace(nodes)
 	return ss
 }
 
-func (ss *ServiceSet) ensureNodeIndex() {
-	if ss.nodeIndex != nil {
+func (ss *ServiceSet) ensureNodePositions() {
+	if ss.nodePositions != nil {
 		return
 	}
-	ss.nodeIndex = make(map[string]int, len(ss.nodes))
+	ss.nodePositions = make(map[string]int, len(ss.nodes))
 	for i, n := range ss.nodes {
-		ss.nodeIndex[n] = i
+		ss.nodePositions[n] = i
+	}
+}
+
+func resolveForwarders(nodes []string, nodeMap map[string]*nodeContext) []*forwarder.Forwarder {
+	forwarders := make([]*forwarder.Forwarder, 0, len(nodes))
+	for _, node := range nodes {
+		if ctx, ok := nodeMap[node]; ok {
+			forwarders = append(forwarders, ctx.forwarder)
+		}
+	}
+	return forwarders
+}
+
+func buildRoundRobin(nodes []string, nodeMap map[string]*nodeContext) *loadbalance.RoundRobin {
+	return loadbalance.NewRoundRobin(resolveForwarders(nodes, nodeMap))
+}
+
+func buildLeastInFlight(nodes []string, nodeMap map[string]*nodeContext) *loadbalance.LeastInFlight {
+	return loadbalance.NewLeastInFlight(resolveForwarders(nodes, nodeMap))
+}
+
+func rebuildLoadBalancer(ss *ServiceSet, nodeMap map[string]*nodeContext) {
+	switch ss.strategy {
+	case loadbalance.StrategyLeastInFlight, loadbalance.StrategyP2C:
+		ss.leastInFlight.Store(buildLeastInFlight(ss.nodes, nodeMap))
+	default:
+		ss.roundRobin.Store(buildRoundRobin(ss.nodes, nodeMap))
 	}
 }
 
 func (ss *ServiceSet) replace(nodes []string) {
 	ss.nodes = nodes
-	ss.nodeIndex = make(map[string]int, len(nodes))
+	ss.nodePositions = make(map[string]int, len(nodes))
 	for i, n := range nodes {
-		ss.nodeIndex[n] = i
+		ss.nodePositions[n] = i
 	}
 }
 
 func (ss *ServiceSet) contains(node string) bool {
-	ss.ensureNodeIndex()
-	_, ok := ss.nodeIndex[node]
+	ss.ensureNodePositions()
+	_, ok := ss.nodePositions[node]
 	return ok
 }
 
-func (ss *ServiceSet) add(node string) bool {
-	ss.ensureNodeIndex()
-	if _, ok := ss.nodeIndex[node]; ok {
+func (ss *ServiceSet) sameNodes(nodes []string) bool {
+	if len(nodes) != len(ss.nodes) {
 		return false
 	}
-	ss.nodeIndex[node] = len(ss.nodes)
+	ss.ensureNodePositions()
+	for _, n := range nodes {
+		if _, ok := ss.nodePositions[n]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (ss *ServiceSet) add(node string) bool {
+	ss.ensureNodePositions()
+	if _, ok := ss.nodePositions[node]; ok {
+		return false
+	}
+	ss.nodePositions[node] = len(ss.nodes)
 	ss.nodes = append(ss.nodes, node)
 	return true
 }
 
 func (ss *ServiceSet) remove(node string) bool {
-	ss.ensureNodeIndex()
-	removedIdx, ok := ss.nodeIndex[node]
+	ss.ensureNodePositions()
+	removedIdx, ok := ss.nodePositions[node]
 	if !ok {
 		return false
 	}
@@ -82,15 +124,24 @@ func (ss *ServiceSet) remove(node string) bool {
 	ss.nodes[removedIdx] = lastNode
 	ss.nodes = ss.nodes[:lastIdx]
 	if lastNode != node {
-		ss.nodeIndex[lastNode] = removedIdx
+		ss.nodePositions[lastNode] = removedIdx
 	}
-	delete(ss.nodeIndex, node)
+	delete(ss.nodePositions, node)
 	return true
 }
 
 type nodeContext struct {
 	serviceName string
 	forwarder   *forwarder.Forwarder
+}
+
+func newForwarder(serviceName, node string, failureChan chan forwarder.FailureForwarder) *forwarder.Forwarder {
+	weight, ok := loadbalance.ParseNodeWeight(node)
+	if !ok {
+		logs.Out.Warn("Invalid node weight suffix, defaulting to 1",
+			zap.String("service", serviceName), zap.String("path", node))
+	}
+	return forwarder.New(serviceName, node, weight, failureChan)
 }
 
 func NewRegistry() (*Registry, error) {
@@ -133,7 +184,9 @@ func (r *Registry) listenFailures() {
 
 func (r *Registry) moveToUnhealthyUnsafe(serviceName, nodePath string) {
 	if ss, ok := r.services[serviceName]; ok {
-		ss.remove(nodePath)
+		if ss.remove(nodePath) {
+			rebuildLoadBalancer(ss, r.nodeMap)
+		}
 		if len(ss.nodes) == 0 {
 			delete(r.services, serviceName)
 		}
@@ -142,7 +195,7 @@ func (r *Registry) moveToUnhealthyUnsafe(serviceName, nodePath string) {
 
 	us, ok := r.unhealthy[serviceName]
 	if !ok {
-		us = newServiceSet(nil, StrategyRoundRobin)
+		us = newServiceSet(nil, loadbalance.StrategyRoundRobin)
 		r.unhealthy[serviceName] = us
 	}
 	us.add(nodePath)
@@ -181,26 +234,6 @@ func (r *Registry) GetState() map[string][]string {
 	return state
 }
 
-func (r *Registry) GetForwarder(serviceName string) (*forwarder.Forwarder, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	ss, exists := r.services[serviceName]
-	if !exists || len(ss.nodes) == 0 {
-		return nil, os.ErrNotExist
-	}
-
-	idx := ss.index.Add(1) % uint32(len(ss.nodes))
-	nodePath := ss.nodes[idx]
-
-	ctx, ok := r.nodeMap[nodePath]
-	if !ok {
-		return nil, os.ErrNotExist
-	}
-
-	return ctx.forwarder, nil
-}
-
 // GetForwarders returns all healthy forwarders for a service, ordered starting
 // from the round-robin position, then reordered per ss.strategy. The index
 // advances only once per call so that retry loops within a single request
@@ -214,22 +247,14 @@ func (r *Registry) GetForwarders(serviceName string) []*forwarder.Forwarder {
 		return nil
 	}
 
-	n := len(ss.nodes)
-	start := int(ss.index.Add(1)) % n
-	result := make([]*forwarder.Forwarder, 0, n)
-	for i := range n {
-		ctx, ok := r.nodeMap[ss.nodes[(start+i)%n]]
-		if ok {
-			result = append(result, ctx.forwarder)
-		}
-	}
-
 	switch ss.strategy {
-	case StrategyLeastInFlight:
-		result = SortByLoad(result)
+	case loadbalance.StrategyLeastInFlight:
+		return ss.leastInFlight.Load().Get()
+	case loadbalance.StrategyP2C:
+		return ss.leastInFlight.Load().GetP2C()
+	default:
+		return ss.roundRobin.Load().Get()
 	}
-
-	return result
 }
 
 func (*Registry) Extension() string {
@@ -253,7 +278,7 @@ func (r *Registry) ApplyFullScan(baseDir string, byService map[string]map[string
 			if _, exists := r.nodeMap[node]; !exists {
 				r.nodeMap[node] = &nodeContext{
 					serviceName: svcName,
-					forwarder:   forwarder.New(svcName, node, r.failureChan),
+					forwarder:   newForwarder(svcName, node, r.failureChan),
 				}
 			}
 
@@ -263,11 +288,16 @@ func (r *Registry) ApplyFullScan(baseDir string, byService map[string]map[string
 		}
 
 		if len(healthyNodes) > 0 {
-			if ss, exists := r.services[svcName]; exists {
-				ss.replace(healthyNodes)
+			if existing, exists := r.services[svcName]; exists {
+				if !existing.sameNodes(healthyNodes) {
+					existing.replace(healthyNodes)
+					rebuildLoadBalancer(existing, r.nodeMap)
+				}
 			} else {
 				strategy := readStrategyAtCreation(baseDir, svcName)
-				r.services[svcName] = newServiceSet(healthyNodes, strategy)
+				ss := newServiceSet(healthyNodes, strategy)
+				r.services[svcName] = ss
+				rebuildLoadBalancer(ss, r.nodeMap)
 			}
 		} else {
 			delete(r.services, svcName)
@@ -320,7 +350,7 @@ func (r *Registry) ApplyServiceScan(baseDir string, serviceName string, discover
 		if _, exists := r.nodeMap[node]; !exists {
 			r.nodeMap[node] = &nodeContext{
 				serviceName: serviceName,
-				forwarder:   forwarder.New(serviceName, node, r.failureChan),
+				forwarder:   newForwarder(serviceName, node, r.failureChan),
 			}
 		}
 
@@ -331,11 +361,16 @@ func (r *Registry) ApplyServiceScan(baseDir string, serviceName string, discover
 
 	// 3. Update service set
 	if len(finalHealthyNodes) > 0 {
-		if ss, exists := r.services[serviceName]; exists {
-			ss.replace(finalHealthyNodes)
+		if existing, exists := r.services[serviceName]; exists {
+			if !existing.sameNodes(finalHealthyNodes) {
+				existing.replace(finalHealthyNodes)
+				rebuildLoadBalancer(existing, r.nodeMap)
+			}
 		} else {
 			strategy := readStrategyAtCreation(baseDir, serviceName)
-			r.services[serviceName] = newServiceSet(finalHealthyNodes, strategy)
+			ss := newServiceSet(finalHealthyNodes, strategy)
+			r.services[serviceName] = ss
+			rebuildLoadBalancer(ss, r.nodeMap)
 		}
 	} else {
 		delete(r.services, serviceName)
@@ -361,7 +396,9 @@ func (r *Registry) removeNodeUnsafe(nodePath string, shouldDeleteFile bool) {
 	delete(r.nodeMap, nodePath)
 
 	if ss, ok := r.services[serviceName]; ok {
-		ss.remove(nodePath)
+		if ss.remove(nodePath) {
+			rebuildLoadBalancer(ss, r.nodeMap)
+		}
 		metrics.Global.ServiceNodesActive.WithLabelValues(serviceName).Set(float64(len(ss.nodes)))
 		if len(ss.nodes) == 0 {
 			delete(r.services, serviceName)
@@ -428,21 +465,26 @@ func (r *Registry) promoteToHealthyUnsafe(serviceName, nodePath string) {
 
 	ss, ok := r.services[serviceName]
 	if !ok {
-		ss = newServiceSet(nil, StrategyRoundRobin)
+		ss = newServiceSet(nil, loadbalance.StrategyRoundRobin)
 		r.services[serviceName] = ss
 	}
 
-	ss.add(nodePath)
+	if ss.add(nodePath) {
+		rebuildLoadBalancer(ss, r.nodeMap)
+	}
 
 	metrics.Global.ServiceNodesActive.WithLabelValues(serviceName).Set(float64(len(ss.nodes)))
 }
 
-func (r *Registry) setStrategy(serviceName string, s Strategy) {
+func (r *Registry) setStrategy(serviceName string, s loadbalance.Strategy) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if ss, ok := r.services[serviceName]; ok {
-		ss.strategy = s
+	ss, ok := r.services[serviceName]
+	if !ok || ss.strategy == s {
+		return
 	}
+	ss.strategy = s
+	rebuildLoadBalancer(ss, r.nodeMap)
 }
 
 func (r *Registry) serviceNames() []string {

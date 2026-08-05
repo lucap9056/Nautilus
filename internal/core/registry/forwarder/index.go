@@ -52,10 +52,11 @@ type Forwarder struct {
 	isFailed     atomic.Bool
 	useHTTP2     atomic.Bool
 	inFlight     atomic.Int64
+	weight       int32
 	transport    *dualTransport
 }
 
-func New(serviceName, nodePath string, onFailure chan FailureForwarder) *Forwarder {
+func New(serviceName, nodePath string, weight int32, onFailure chan FailureForwarder) *Forwarder {
 	dialContext := func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", nodePath)
 	}
@@ -82,6 +83,7 @@ func New(serviceName, nodePath string, onFailure chan FailureForwarder) *Forward
 		serviceName: serviceName,
 		socketPath:  nodePath,
 		onFailure:   onFailure,
+		weight:      weight,
 	}
 	f.transport = &dualTransport{useHTTP2: &f.useHTTP2, h1: h1Transport, h2: h2Transport}
 	f.client = &http.Client{
@@ -108,8 +110,12 @@ func (f *Forwarder) Wait() {
 	f.wg.Wait()
 }
 
-func (f *Forwarder) InFlight() int64 {
-	return f.inFlight.Load()
+func (f *Forwarder) InFlightWeight() int64 {
+	return f.inFlight.Load() / int64(f.weight)
+}
+
+func (f *Forwarder) Weight() int32 {
+	return f.weight
 }
 
 func createReverseProxy(serviceName, nodePath string, transport http.RoundTripper, onFailure chan FailureForwarder, isFailed *atomic.Bool) *httputil.ReverseProxy {
