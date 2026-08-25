@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"context"
+	"errors"
 	"io"
 	"nautrouds/internal/core/tempresp"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -169,7 +171,7 @@ func TestForwarder_FailureReporting(t *testing.T) {
 		w := httptest.NewRecorder()
 
 		err := f.Forward(w, req)
-		assert.Equal(t, ErrNodeUnavailable, err)
+		assert.True(t, err == ErrNodeUnavailable || err == ErrNodeFailed, "got %v", err)
 
 		select {
 		case failure := <-onFailure:
@@ -326,7 +328,7 @@ func TestForwarder_Forward_InFlightDecrementsOnError(t *testing.T) {
 	w := httptest.NewRecorder()
 
 	err = f.Forward(w, req)
-	assert.Equal(t, ErrNodeUnavailable, err)
+	assert.True(t, err == ErrNodeUnavailable || err == ErrNodeFailed, "got %v", err)
 	assert.EqualValues(t, 0, f.InFlightWeight())
 }
 
@@ -345,8 +347,87 @@ func TestForwarder_ForwardMiddleware_InFlightDecrementsOnError(t *testing.T) {
 	defer tempresp.Pool.Put(w)
 
 	err = f.ForwardMiddleware(w, req, nil, "/", nil)
-	assert.Equal(t, ErrNodeUnavailable, err)
+	assert.True(t, err == ErrNodeUnavailable || err == ErrNodeFailed, "got %v", err)
 	assert.EqualValues(t, 0, f.InFlightWeight())
+}
+
+func TestForwarder_Forward_ReturnsErrNodeFailedWhenAlreadyFailed(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nautrouds-node-failed-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	socketPath := filepath.Join(tmpDir, "test.sock")
+	onFailure := make(chan FailureForwarder, 1)
+	f := New("test-service", socketPath, 1, onFailure)
+	f.isFailed.Store(true)
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	w := httptest.NewRecorder()
+
+	err = f.Forward(w, req)
+	assert.Equal(t, ErrNodeFailed, err)
+}
+
+func TestForwarder_ForwardMiddleware_ReturnsErrNodeFailedWhenAlreadyFailed(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nautrouds-mw-node-failed-test-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	socketPath := filepath.Join(tmpDir, "mw.sock")
+	onFailure := make(chan FailureForwarder, 1)
+	f := New("test-service", socketPath, 1, onFailure)
+	f.isFailed.Store(true)
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	w := tempresp.Pool.Get().(*tempresp.ResponseWriter)
+	defer tempresp.Pool.Put(w)
+
+	err = f.ForwardMiddleware(w, req, nil, "/", nil)
+	assert.Equal(t, ErrNodeFailed, err)
+}
+
+func TestCreateReverseProxy_ErrorHandler_DialOpErrorIsNodeUnavailable(t *testing.T) {
+	onFailure := make(chan FailureForwarder, 1)
+	var isFailed atomic.Bool
+	rp := createReverseProxy("test-service", "/tmp/test.sock", http.DefaultTransport, onFailure, &isFailed)
+
+	var capturedErr error
+	ctx := context.WithValue(context.Background(), proxyErrorKey{}, &capturedErr)
+	req := httptest.NewRequest("GET", "http://example.com/", nil).WithContext(ctx)
+
+	rp.ErrorHandler(httptest.NewRecorder(), req, &net.OpError{Op: "dial", Net: "unix", Err: errors.New("no such file or directory")})
+
+	assert.ErrorIs(t, capturedErr, ErrNodeUnavailable)
+	assert.True(t, isFailed.Load())
+
+	select {
+	case failure := <-onFailure:
+		assert.Equal(t, "/tmp/test.sock", failure.SocketPath)
+	default:
+		t.Fatal("expected a failure to be reported")
+	}
+}
+
+func TestCreateReverseProxy_ErrorHandler_NonDialOpErrorIsUpstreamFailed(t *testing.T) {
+	onFailure := make(chan FailureForwarder, 1)
+	var isFailed atomic.Bool
+	rp := createReverseProxy("test-service", "/tmp/test.sock", http.DefaultTransport, onFailure, &isFailed)
+
+	var capturedErr error
+	ctx := context.WithValue(context.Background(), proxyErrorKey{}, &capturedErr)
+	req := httptest.NewRequest("GET", "http://example.com/", nil).WithContext(ctx)
+
+	rp.ErrorHandler(httptest.NewRecorder(), req, &net.OpError{Op: "write", Net: "unix", Err: errors.New("broken pipe")})
+
+	assert.ErrorIs(t, capturedErr, ErrUpstreamFailed)
+	assert.True(t, isFailed.Load())
+
+	select {
+	case failure := <-onFailure:
+		assert.Equal(t, "/tmp/test.sock", failure.SocketPath)
+	default:
+		t.Fatal("expected a failure to be reported")
+	}
 }
 
 func TestForwarder_Forward_ConcurrentInFlightCount(t *testing.T) {

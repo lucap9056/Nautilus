@@ -113,7 +113,7 @@ func (m *Manager) runMiddlewareChain(s *servingState) bool {
 				}
 			}
 
-			handler(s.tempResp, s.r, mr)
+			handler(s.tempResp, s.r, mr, s.options)
 			if s.tempResp.GetCode() != http.StatusOK {
 				if !s.tempResp.IsPassthrough() {
 					s.tempResp.WriteTo(s.w)
@@ -136,7 +136,7 @@ func (m *Manager) runMiddlewareChain(s *servingState) bool {
 					approved = true
 					break
 				}
-				if mwErr == forwarder.ErrNodeUnavailable {
+				if mwErr == forwarder.ErrNodeUnavailable || mwErr == forwarder.ErrNodeFailed {
 					continue
 				}
 				if errors.Is(mwErr, forwarder.ErrServerError) {
